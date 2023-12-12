@@ -252,7 +252,8 @@ class FetchEmails extends Command
                     $this->line('['.date('Y-m-d H:i:s').'] '.$message_index.') '.$message->getSubject());
                     $message_index++;
 
-                    $this->processMessage($message, $message_id, $mailbox, $this->mailboxes);
+                    $dest_mailbox = \Eventy::filter('fetch_emails.mailbox_to_save_message', $mailbox, $folder);
+                    $this->processMessage($message, $message_id, $dest_mailbox, $this->mailboxes);
                 }
                 $page++;
             } while (count($messages) == self::PAGE_SIZE);
@@ -267,7 +268,13 @@ class FetchEmails extends Command
 
             // From - $from is the plain text email.
             $from = $message->getReplyTo();
-            if (!$from) {
+
+            if (!$from 
+                // https://github.com/freescout-helpdesk/freescout/issues/3101
+                || !($reply_to = $this->formatEmailList($from))
+                || empty($reply_to[0])
+                || preg_match('/^.+@unknown$/', $reply_to[0])
+            ) {
                 $from = $message->getFrom();
             }
             // https://github.com/freescout-helpdesk/freescout/issues/2833
@@ -280,12 +287,15 @@ class FetchEmails extends Command
                 }
             }*/
 
+            if ($from) {
+                $from = $this->formatEmailList($from);
+            }
+
             if (!$from) {
                 $this->logError('From is empty');
                 $this->setSeen($message, $mailbox);
                 return;
             } else {
-                $from = $this->formatEmailList($from);
                 $from = $from[0];
             }
 
@@ -298,6 +308,22 @@ class FetchEmails extends Command
             }
 
             $duplicate_message_id = false;
+
+            // Special hack to allow threading into conversations Jira messages.
+            // https://github.com/freescout-helpdesk/freescout/issues/2927
+            // 
+            // Jira does not properly populate Reference / In-Reply-To headers.
+            // When Jira sends a reply the In-Reply-To header is set to:
+            // JIRA.$\{issue-id}.$\{issue-created-date-millis}@$\{host}
+            // 
+            // If we see the first message of a ticket we change the Message-ID,
+            // so all follow-ups in the ticket are nicely threaded.
+            $jira_message_id = preg_replace('/^(JIRA\.\d+\.\d+)\..*(@Atlassian.JIRA)/', '\1\2', $message_id);
+            if ($jira_message_id != $message_id) {
+                if (!Thread::where('message_id', $jira_message_id)->exists()) {
+                    $message_id = $jira_message_id;
+                }
+            }
 
             if (!$extra) {
                 $duplicate_message_id = Thread::where('message_id', $message_id)->first();
@@ -478,7 +504,7 @@ class FetchEmails extends Command
                         $prev_thread_id = '';
 
                         // Customer replied to the email from user
-                        preg_match('/^'.\MailHelper::MESSAGE_ID_PREFIX_REPLY_TO_CUSTOMER."\-(\d+)\-([^@]+)@/", $prev_message_id, $m);
+                        preg_match('/^'.\MailHelper::MESSAGE_ID_PREFIX_REPLY_TO_CUSTOMER."\-(\d+)\-([a-z0-9]+)@/", $prev_message_id, $m);
                         // Simply checking thread_id from message_id was causing an issue when 
                         // customer was sending a message from FreeScout - the message was 
                         // connected to the wrong conversation.
@@ -496,7 +522,7 @@ class FetchEmails extends Command
 
                         // Customer replied to the auto reply
                         if (!$prev_thread_id) {
-                            preg_match('/^'.\MailHelper::MESSAGE_ID_PREFIX_AUTO_REPLY."\-(\d+)\-([^@]+)@/", $prev_message_id, $m);
+                            preg_match('/^'.\MailHelper::MESSAGE_ID_PREFIX_AUTO_REPLY."\-(\d+)\-([a-z0-9]+)@/", $prev_message_id, $m);
                             if (!empty($m[1]) && !empty($m[2])) {
                                 $message_id_hash = $m[2];
                                 if (strlen($message_id_hash) == 16) {
@@ -535,10 +561,18 @@ class FetchEmails extends Command
             }
 
             // Make sure that prev_thread belongs to the current mailbox.
-            // It may happen when forwarding conversation for example.
-            if ($prev_thread) {
+            // Problems may arise when forwarding conversation for example.
+            //
+            // For replies to email notifications it's allowed to have prev_thread in
+            // another mailbox as conversation can be moved.
+            // https://github.com/freescout-helpdesk/freescout/issues/3455
+            if ($prev_thread && $message_from_customer) {
                 if ($prev_thread->conversation->mailbox_id != $mailbox->id) {
                     // https://github.com/freescout-helpdesk/freescout/issues/2807
+                    // Behaviour of email sent to multiple mailboxes:
+                    // If a user from either mailbox replies, then a new conversation is created
+                    // in the other mailbox with another new conversation ID.
+                    // 
                     // Try to get thread by generated message ID.
                     if ($in_reply_to) {
                         $prev_thread = Thread::where('message_id', \MailHelper::generateMessageId($in_reply_to, $mailbox->id.$in_reply_to))->first();
@@ -559,12 +593,15 @@ class FetchEmails extends Command
                 // Get body and do not replace :cid with images base64
                 $html_body = $message->getHTMLBody(false);
             }
+            $is_html = true;
             if ($html_body) {
-                $body = $this->separateReply($html_body, true, $is_reply);
+                $body = $html_body;
             } else {
+                $is_html = false;
                 $body = $message->getTextBody();
-                $body = $this->separateReply($body, false, $is_reply);
             }
+            $body = $this->separateReply($body, $is_html, $is_reply, !$message_from_customer);
+
             // We have to fetch absolutely all emails, even with empty body.
             // if (!$body) {
             //     $this->logError('Message body is empty');
@@ -572,7 +609,8 @@ class FetchEmails extends Command
             //     continue;
             // }
 
-            $subject = $message->getSubject();
+            // Webklex/php-imap returns object instead of a string.
+            $subject = $message->getSubject()."";
 
             // Convert subject encoding
             if (preg_match('/=\?[a-z\d-]+\?[BQ]\?.*\?=/i', $subject)) {
@@ -633,6 +671,19 @@ class FetchEmails extends Command
             );
             $this->createCustomers($emails, $mailbox->getEmails());
 
+            $date = $this->attrToDate($message->getDate());
+
+            if ($date) {
+                $app_timezone = config('app.timezone');
+                if ($app_timezone) {
+                    $date->setTimezone($app_timezone);
+                }
+            }
+            $now = now();
+            if (!$date || $date->greaterThan($now)) {
+                $date = $now;
+            }
+
             $data = \Eventy::filter('fetch_emails.data_to_save', [
                 'mailbox'     => $mailbox,
                 'message_id'  => $message_id,
@@ -648,47 +699,51 @@ class FetchEmails extends Command
                 'is_bounce'   => $is_bounce,
                 'message_from_customer' => $message_from_customer,
                 'user'        => $user,
+                'date'        => $date,
             ]);
 
             $new_thread = null;
             if ($message_from_customer) {
 
-                if (!$data['prev_thread']) {
-                    // Maybe this email need to be imported also into other mailbox.
+                // We should import the message into other mailboxes even if previous thread is set.
+                // https://github.com/freescout-helpdesk/freescout/issues/3473
+                //if (!$data['prev_thread']) {
+                
+                // Maybe this email need to be imported also into other mailbox.
 
-                    $recipient_emails = array_unique($this->formatEmailList(array_merge(
-                        $this->attrToArray($message->getTo()), 
-                        $this->attrToArray($message->getCc()), 
-                        // It will always return an empty value as it's Bcc.
-                        $this->attrToArray($message->getBcc())
-                    )));
-                    
-                    if (count($mailboxes) && count($recipient_emails) > 1) {
-                        foreach ($mailboxes as $check_mailbox) {
-                            if ($check_mailbox->id == $mailbox->id) {
-                                continue;
-                            }
-                            if (!$check_mailbox->isInActive()) {
-                                continue;
-                            }
-                            foreach ($recipient_emails as $recipient_email) {
-                                // No need to check mailbox aliases.
-                                if (\App\Email::sanitizeEmail($check_mailbox->email) == $recipient_email) {
-                                    $this->extra_import[] = [
-                                        'mailbox'    => $check_mailbox,
-                                        'message'    => $message,
-                                        'message_id' => $message_id,
-                                    ];
-                                    break;
-                                }
+                $recipient_emails = array_unique($this->formatEmailList(array_merge(
+                    $this->attrToArray($message->getTo()), 
+                    $this->attrToArray($message->getCc()), 
+                    // It will always return an empty value as it's Bcc.
+                    $this->attrToArray($message->getBcc())
+                )));
+                
+                if (count($mailboxes) && count($recipient_emails) > 1) {
+                    foreach ($mailboxes as $check_mailbox) {
+                        if ($check_mailbox->id == $mailbox->id) {
+                            continue;
+                        }
+                        if (!$check_mailbox->isInActive()) {
+                            continue;
+                        }
+                        foreach ($recipient_emails as $recipient_email) {
+                            // No need to check mailbox aliases.
+                            if (\App\Email::sanitizeEmail($check_mailbox->email) == $recipient_email) {
+                                $this->extra_import[] = [
+                                    'mailbox'    => $check_mailbox,
+                                    'message'    => $message,
+                                    'message_id' => $message_id,
+                                ];
+                                break;
                             }
                         }
                     }
                 }
+                //}
 
                 if (\Eventy::filter('fetch_emails.should_save_thread', true, $data) !== false) {
                     // SendAutoReply listener will check bounce flag and will not send an auto reply if this is an auto responder.
-                    $new_thread = $this->saveCustomerThread($mailbox, $data['message_id'], $data['prev_thread'], $data['from'], $data['to'], $data['cc'], $data['bcc'], $data['subject'], $data['body'], $data['attachments'], $data['message']->getHeader());
+                    $new_thread = $this->saveCustomerThread($mailbox, $data['message_id'], $data['prev_thread'], $data['from'], $data['to'], $data['cc'], $data['bcc'], $data['subject'], $data['body'], $data['attachments'], $data['message']->getHeader(), $data['date']);
                 } else {
                     $this->line('['.date('Y-m-d H:i:s').'] Hook fetch_emails.should_save_thread returned false. Skipping message.');
                     $this->setSeen($message, $mailbox);
@@ -707,8 +762,17 @@ class FetchEmails extends Command
                     return;
                 }
 
+                // Save user thread only if there prev_thread is set.
+                // https://github.com/freescout-helpdesk/freescout/issues/3455
+                if (!$prev_thread) {
+                    $this->logError("Support agent's reply to the email notification could not be processed as previous thread could not be determined.");
+                    $this->setSeen($message, $mailbox);
+
+                    return;
+                }
+
                 if (\Eventy::filter('fetch_emails.should_save_thread', true, $data) !== false) {
-                    $new_thread = $this->saveUserThread($data['mailbox'], $data['message_id'], $data['prev_thread'], $data['user'], $data['from'], $data['to'], $data['cc'], $data['bcc'], $data['body'], $data['attachments'], $data['message']->getHeader());
+                    $new_thread = $this->saveUserThread($data['mailbox'], $data['message_id'], $data['prev_thread'], $data['user'], $data['from'], $data['to'], $data['cc'], $data['bcc'], $data['body'], $data['attachments'], $data['message']->getHeader(), $data['date']);
                 } else {
                     $this->line('['.date('Y-m-d H:i:s').'] Hook fetch_emails.should_save_thread returned false. Skipping message.');
                     $this->setSeen($message, $mailbox);
@@ -826,14 +890,22 @@ class FetchEmails extends Command
     /**
      * Save email from customer as thread.
      */
-    public function saveCustomerThread($mailbox, $message_id, $prev_thread, $from, $to, $cc, $bcc, $subject, $body, $attachments, $headers)
+    public function saveCustomerThread($mailbox, $message_id, $prev_thread, $from, $to, $cc, $bcc, $subject, $body, $attachments, $headers, $date)
     {
-        // Find conversation
+        // Fetch date & time setting.
+        $use_mail_date_on_fetching = config('app.use_mail_date_on_fetching');
+
+        // Find conversation.
         $new = false;
         $conversation = null;
         $prev_customer_id = null;
-        $now = date('Y-m-d H:i:s');
+        if ($use_mail_date_on_fetching) {
+            $now = $date;
+        }else{
+            $now = date('Y-m-d H:i:s');
+        }
         $conv_cc = $cc;
+        $prev_conv_cc = $conv_cc;
 
         // Customers are created before with email and name
         $customer = Customer::create($from);
@@ -843,6 +915,7 @@ class FetchEmails extends Command
             // If reply came from another customer: change customer, add original as CC.
             // If FreeScout will not change the customer, the reply will be shown 
             // as coming from the original customer (not the real sender) and cause confusion.
+            // Below after events are fired we roll customer back.
             if ($conversation->customer_id != $customer->id) {
                 $prev_customer_id = $conversation->customer_id;
                 $prev_customer_email = $conversation->customer_email;
@@ -867,11 +940,14 @@ class FetchEmails extends Command
             $conversation->created_by_customer_id = $customer->id;
             $conversation->source_via = Conversation::PERSON_CUSTOMER;
             $conversation->source_type = Conversation::SOURCE_TYPE_EMAIL;
+            $conversation->created_at = $now;
         }
 
+        $prev_has_attachments = $conversation->has_attachments;
         // Update has_attachments only if email has attachments AND conversation hasn't has_attachments already set
         // Prevent to set has_attachments value back to 0 if the new reply doesn't have any attachment
         if (!$conversation->has_attachments && count($attachments)) {
+            // Later we will check which attachments are embedded.
             $conversation->has_attachments = true;
         }
 
@@ -915,18 +991,39 @@ class FetchEmails extends Command
         $thread->source_type = Thread::SOURCE_TYPE_EMAIL;
         $thread->customer_id = $customer->id;
         $thread->created_by_customer_id = $customer->id;
+        $thread->created_at = $now;
+        $thread->updated_at = $now;
         if ($new) {
             $thread->first = true;
         }
-        $thread->save();
+        try {
+            $thread->save();
+        } catch (\Exception $e) {
+            // Could not save thread.
+            // https://github.com/freescout-helpdesk/freescout/issues/3186
+            if ($new) {
+                $conversation->deleteForever();
+            }
+            throw $e;
+        }
 
+        $body_changed = false;
         $saved_attachments = $this->saveAttachments($attachments, $thread->id);
         if ($saved_attachments) {
             $thread->has_attachments = true;
 
             // After attachments saved to the disk we can replace cids in body (for PLAIN and HTML body)
-            $thread->body = $this->replaceCidsWithAttachmentUrls($thread->body, $saved_attachments);
+            $thread->body = $this->replaceCidsWithAttachmentUrls($thread->body, $saved_attachments, $conversation, $prev_has_attachments);
+            $body_changed = true;
+        }
 
+        $new_body = Thread::replaceBase64ImagesWithAttachments($thread->body);
+        if ($new_body != $thread->body) {
+            $thread->body = $new_body;
+            $body_changed = true;
+        }
+
+        if ($body_changed) {
             $thread->save();
         }
 
@@ -951,8 +1048,16 @@ class FetchEmails extends Command
         }
 
         // Conversation customer changed
+        // if ($prev_customer_id) {
+        //     event(new ConversationCustomerChanged($conversation, $prev_customer_id, $prev_customer_email, null, $customer));
+        // }
+
+        // Return original customer back.
         if ($prev_customer_id) {
-            event(new ConversationCustomerChanged($conversation, $prev_customer_id, $prev_customer_email, null, $customer));
+            $conversation->customer_id = $prev_customer_id;
+            $conversation->customer_email = $prev_customer_email;
+            $conversation->setCc(array_merge($prev_conv_cc, array_diff($to, $mailbox->getEmails())));
+            $conversation->save();
         }
 
         return $thread;
@@ -961,10 +1066,17 @@ class FetchEmails extends Command
     /**
      * Save email reply from user as thread.
      */
-    public function saveUserThread($mailbox, $message_id, $prev_thread, $user, $from, $to, $cc, $bcc, $body, $attachments, $headers)
+    public function saveUserThread($mailbox, $message_id, $prev_thread, $user, $from, $to, $cc, $bcc, $body, $attachments, $headers, $date)
     {
+        // fetch time setting.
+        $use_mail_date_on_fetching = config('app.use_mail_date_on_fetching');
+
         $conversation = null;
-        $now = date('Y-m-d H:i:s');
+        if ($use_mail_date_on_fetching) {
+            $now = $date;
+        }else{
+            $now = date('Y-m-d H:i:s');
+        }
         $user_id = $user->id;
 
         $conversation = $prev_thread->conversation;
@@ -984,6 +1096,12 @@ class FetchEmails extends Command
             case Mailbox::TICKET_ASSIGNEE_KEEP_CURRENT:
                 // Do nothing.
                 break;
+        }
+
+        $prev_has_attachments = $conversation->has_attachments;
+        if (!$conversation->has_attachments && count($attachments)) {
+            // Later we will check which attachments are embedded.
+            $conversation->has_attachments = true;
         }
 
         // Save extra recipients to CC
@@ -1031,15 +1149,27 @@ class FetchEmails extends Command
         $thread->source_type = Thread::SOURCE_TYPE_EMAIL;
         $thread->customer_id = $conversation->customer_id;
         $thread->created_by_user_id = $user_id;
+        $thread->created_at = $now;
+        $thread->updated_at = $now;
         $thread->save();
 
+        $body_changed = false;
         $saved_attachments = $this->saveAttachments($attachments, $thread->id);
         if ($saved_attachments) {
             $thread->has_attachments = true;
 
             // After attachments saved to the disk we can replace cids in body (for PLAIN and HTML body)
-            $thread->body = $this->replaceCidsWithAttachmentUrls($thread->body, $saved_attachments);
+            $thread->body = $this->replaceCidsWithAttachmentUrls($thread->body, $saved_attachments, $conversation, $prev_has_attachments);
+            $body_changed = true;
+        }
 
+        $new_body = Thread::replaceBase64ImagesWithAttachments($thread->body);
+        if ($new_body != $thread->body) {
+            $thread->body = $new_body;
+            $body_changed = true;
+        }
+
+        if ($body_changed) {
             $thread->save();
         }
 
@@ -1066,8 +1196,8 @@ class FetchEmails extends Command
                 $email_attachment->getMimeType(),
                 Attachment::typeNameToInt($email_attachment->getType()),
                 $email_attachment->getContent(),
-                '',
-                false,
+                $uploaded_file = '',
+                $embedded = false,
                 $thread_id
             );
             if ($created_attachment) {
@@ -1103,7 +1233,7 @@ class FetchEmails extends Command
      *
      * @return string
      */
-    public function separateReply($body, $is_html, $is_reply)
+    public function separateReply($body, $is_html, $is_reply, $user_reply_to_notification = false)
     {
         $cmp_reply_length_desc = function ($a, $b) {
             if (mb_strlen($a) == mb_strlen($b)) {
@@ -1153,10 +1283,17 @@ class FetchEmails extends Command
         if ($is_reply) {
             // Check all separators and choose the shortest reply
             $reply_bodies = [];
+
             $reply_separators = Mail::$alternative_reply_separators;
 
             if (!empty($this->mailbox->before_reply)) {
                 $reply_separators[] = $this->mailbox->before_reply;
+            }
+
+            // If user replied to the email notification use only predefined reply separator.
+            // https://github.com/freescout-helpdesk/freescout/issues/3580
+            if ($user_reply_to_notification && strstr($result, \MailHelper::REPLY_SEPARATOR_NOTIFICATION)) {
+                $reply_separators = [\MailHelper::REPLY_SEPARATOR_NOTIFICATION];
             }
 
             foreach ($reply_separators as $reply_separator) {
@@ -1167,7 +1304,7 @@ class FetchEmails extends Command
                     $parts = explode($reply_separator, $result);
                 }
                 if (count($parts) > 1) {
-                    // Check if past contains any real text.
+                    // Check if part contains any real text.
                     $text = \Helper::htmlToText($parts[0]);
                     $text = trim($text);
                     $text = preg_replace('/^\s+/mu', '', $text);
@@ -1187,8 +1324,10 @@ class FetchEmails extends Command
         return $result;
     }
 
-    public function replaceCidsWithAttachmentUrls($body, $attachments)
+    public function replaceCidsWithAttachmentUrls($body, $attachments, $conversation, $prev_has_attachments)
     {
+        $only_embedded_attachments = true;
+
         foreach ($attachments as $attachment) {
             // webklex:
             // [type] => image
@@ -1217,15 +1356,34 @@ class FetchEmails extends Command
             // [img_src] =>
             // [size] => 2326
             if ($attachment['imap_attachment']->id && (isset($attachment['imap_attachment']->img_src) || strlen($attachment['imap_attachment']->content ?? ''))) {
-                $body = str_replace('cid:'.$attachment['imap_attachment']->id, $attachment['attachment']->url(), $body);
+                $cid = 'cid:'.$attachment['imap_attachment']->id;
+                if (strstr($body, $cid)) {
+                    $body = str_replace($cid, $attachment['attachment']->url(), $body);
+                    // Set embedded flag for the attachment.
+                    $attachment['attachment']->embedded = true;
+                    $attachment['attachment']->save();
+                } else {
+                    $only_embedded_attachments = false;
+                }
+            } else {
+                $only_embedded_attachments = false;
             }
+        }
+
+        if ($only_embedded_attachments 
+            && $conversation 
+            && $conversation->has_attachments
+            && !$prev_has_attachments
+        ) {
+            $conversation->has_attachments = false;
+            $conversation->save();
         }
 
         return $body;
     }
 
     /**
-     * Conver email object to plain emails.
+     * Convert email object to plain emails.
      *
      * @param array $obj_list
      *
@@ -1259,6 +1417,19 @@ class FetchEmails extends Command
 
         if (is_object($attr) && get_class($attr) == 'Webklex\PHPIMAP\Attribute') {
             $attr = $attr->get();
+        }
+
+        return $attr;
+    }
+
+    public function attrToDate($attr)
+    {
+        if (!$attr) {
+            return null;
+        }
+
+        if (is_object($attr) && get_class($attr) == 'Webklex\PHPIMAP\Attribute') {
+            $attr = $attr->toDate();
         }
 
         return $attr;

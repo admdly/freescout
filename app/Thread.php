@@ -2,6 +2,7 @@
 
 namespace App;
 
+use App\SendLog;
 use App\Events\ConversationStatusChanged;
 use App\Events\ConversationUserChanged;
 use App\Events\UserAddedNote;
@@ -308,11 +309,12 @@ class Thread extends Model
 
         // Change "background:" to "background-color:".
         // https://github.com/freescout-helpdesk/freescout/issues/2560
-        $body = preg_replace("/(<[^<>\r\n]+style=[\"'][^\"']*)background: *([^;() ]+;)/", '$1background-color:$2', $body);
+        // Keep in mind that with large texts preg_replace() may return null.
+        $body = preg_replace("/(<[^<>]+style=[\"'][^\"']*)background: *([^;() ]+[;\"'])/", '$1background-color:$2', $body) ?: $body;
 
         // Cut out "collapse" class as it hides elements.
-        $body = preg_replace("/(<[^<>\r\n]+class=([\"'][^\"']* |[\"']))(collapse|hidden)([\"' ])/", '$1$4', $body);
-        
+        $body = preg_replace("/(<[^<>\r\n]+class=([\"'][^\"']* |[\"']))(collapse|hidden)([\"' ])/", '$1$4', $body) ?: $body;
+
         return \Helper::purifyHtml($body);
     }
 
@@ -352,7 +354,7 @@ class Thread extends Model
                 return sprintf('target="_blank" %s', array_shift($m2));
             }, $tpl);
 
-        }, $body);
+        }, $body) ?: $body;
 
         return $body;
     }
@@ -1439,5 +1441,101 @@ class Thread extends Model
     public function isUserMessage()
     {
         return $this->type == self::TYPE_MESSAGE;
+    }
+
+    public static function replaceBase64ImagesWithAttachments($body, $user_id = null)
+    {
+        \Helper::setPcreBacktrackLimit();
+
+        $body = preg_replace_callback("#(<img[^<>]+src=[\"'])data:image/([^;]+);base64,([^\"']+)([\"'])#",
+            function ($match) {
+                $attachment = null;
+                $data = base64_decode($match[3]);
+
+                if ($data) {
+                    $attachment = Attachment::create(
+                        $file_name = number_format(microtime(true), 4, '', '').'.'.$match[2],
+                        $mime_type = 'image/'.$match[2],
+                        $type = Attachment::TYPE_IMAGE,
+                        $data,
+                        $uploaded_file = null,
+                        $embedded = true,
+                        $thread_id = null,
+                        $user_id = \Auth::id()
+                    );
+                }
+                if ($attachment) {
+                    return $match[1].$attachment->url().$match[4];
+                } else {
+                    return $match[0];
+                }
+            }, $body
+        );
+
+        return $body;
+    }
+
+    public function getMessageId($mailbox = null)
+    {
+        if ($this->isCustomerMessage() && $this->message_id) {
+            return $this->message_id;
+        }
+        if ($this->isUserMessage()) {
+            if (!$mailbox) {
+                $mailbox = $this->conversation->mailbox;
+            }
+            return \MailHelper::MESSAGE_ID_PREFIX_REPLY_TO_CUSTOMER.'-'.$this->id.'-'.\MailHelper::getMessageIdHash($this->id).'@'.$mailbox->getEmailDomain();
+        }
+
+        return '';
+    }
+
+    // Sorts threads in desc order by created_at and ID.
+    // 
+    // Threads has to be sorted by created_at and not by id.
+    // https://github.com/freescout-helpdesk/freescout/issues/2938
+    // Sometimes thread.created_at may be the same,
+    // in such cases we also need to sort by thread ID.
+    public static function sortThreads($threads)
+    {
+        return $threads->sort(function ($a, $b) {
+            $a_ts = $a->created_at->getTimestamp();
+            $b_ts = $b->created_at->getTimestamp();
+            if ($a_ts == $b_ts) {
+                if ($a->id < $b->id) {
+                    return 1;
+                } else {
+                    return -1;
+                }
+            } else {
+                return ($a_ts < $b_ts) ? 1 : -1;
+            }
+        });
+    }
+
+    public static function getLastThread($threads)
+    {
+        $threads = self::sortThreads($threads);
+        return $threads->first();
+    }
+
+    public function canRetrySend()
+    {
+        if (!in_array($this->send_status, [SendLog::STATUS_SEND_ERROR, SendLog::STATUS_DELIVERY_ERROR])) {
+            return false;
+        }
+        // Check if failed_job still exists.
+        if (!$this->getFailedJobId()) {
+            return false;
+        }
+
+        return true;
+    }
+
+    public function getFailedJobId()
+    {
+        return \App\FailedJob::where('queue', 'emails')
+            ->where('payload', 'like', '{"displayName":"App\\\\\\\\Jobs\\\\\\\\SendReplyToCustomer"%{i:0;i:'.$this->id.';%')
+            ->value('id');
     }
 }

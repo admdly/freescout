@@ -39,6 +39,10 @@ return [
             'ZIP',
             'iconv',
             'cURL',
+            'DOM',
+            'libxml',
+            //'pcntl',
+            // We keep it as optional, as it's only used to translate dates.
             //'intl',
         ],
         // 'apache' => [
