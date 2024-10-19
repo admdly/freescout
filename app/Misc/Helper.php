@@ -40,6 +40,8 @@ class Helper
      */
     const DIR_PERMISSIONS = 0755;
 
+    const DB_INT_MAX = 2147483647;
+
     public static $csp_nonce = null;
 
     /**
@@ -324,6 +326,9 @@ class Helper
         'ja' => ['name'          => '日本語',
                  'name_en'       => 'Japanese',
         ],
+        'kz' => ['name'          => 'қазақ тілі',
+                 'name_en'       => 'Kazakh',
+        ],
         'ko' => ['name'          => '한국어 (韓國語)',
                  'name_en'       => 'Korean (Johab)',
         ],
@@ -518,19 +523,21 @@ class Helper
     {
         // Remove all kinds of spaces after tags.
         // https://stackoverflow.com/questions/3230623/filter-all-types-of-whitespace-in-php
+        // 
+        // Keep in mind that preg_replace() may return NULL if "u" flag is used.
         $text = preg_replace("/^(.*)>[\r\n]*\s+/mu", '$1>', $text ?? '');
 
         // Remove <script> and <style> blocks.
-        $text = preg_replace('#<script(.*?)>(.*?)</script>#is', '', $text);
-        $text = preg_replace('#<style(.*?)>(.*?)</style>#is', '', $text);
+        $text = preg_replace('#<script(.*?)>(.*?)</script>#is', '', $text ?? '');
+        $text = preg_replace('#<style(.*?)>(.*?)</style>#is', '', $text ?? '');
 
         // Remove tags.
-        $text = strip_tags($text);
-        $text = preg_replace('/\s+/mu', ' ', $text);
+        $text = strip_tags($text ?? '');
+        $text = preg_replace('/\s+/mu', ' ', $text ?? '');
 
         // Trim
-        $text = trim($text);
-        $text = preg_replace('/^\s+/mu', '', $text);
+        $text = trim($text ?? '');
+        $text = preg_replace('/^\s+/mu', '', $text ?? '');
 
         // Causes "General error: 1366 Incorrect string value"
         // Remove "undetectable" whitespaces
@@ -541,9 +548,20 @@ class Helper
         // }
         // $text = urldecode($text);
 
-        $text = trim(preg_replace('/[ ]+/', ' ', $text));
+        $text = trim(preg_replace('/[ ]+/', ' ', $text ?? ''));
 
         return $text;
+    }
+
+    public static function stripDangerousTags($html)
+    {
+        $tags = ['script', 'form', 'iframe'];
+
+        foreach ($tags as $tag) {
+            $html = preg_replace('#<'.$tag.'(.*?)>(.*?)</'.$tag.'>#is', '', $html ?? '');
+        }
+
+        return $html;
     }
 
     /**
@@ -801,6 +819,21 @@ class Helper
         \Log::error($prefix.self::formatException($e));
     }
 
+    public static function encrypt($value, $password = null)
+    {
+        try {
+            if (!$password) {
+                $value = encrypt($value);
+            } else {
+                $value = (new \Illuminate\Encryption\Encrypter(md5($password)))->encrypt($value);
+            }
+        } catch (\Exception $e) {
+            // Do nothing.
+        }
+
+        return $value;
+    }
+
     /**
      * Safely decrypt.
      *
@@ -808,10 +841,14 @@ class Helper
      *
      * @return [type] [description]
      */
-    public static function decrypt($value)
+    public static function decrypt($value, $password = null)
     {
         try {
-            $value = decrypt($value);
+            if (!$password) {
+                $value = decrypt($value);
+            } else {
+                $value = (new \Illuminate\Encryption\Encrypter(md5($password)))->decrypt($value);
+            }
         } catch (\Exception $e) {
             // Do nothing.
         }
@@ -896,14 +933,14 @@ class Helper
         if (is_string($locale) && isset(self::$locales[$locale])) {
             $data = self::$locales[$locale];
         } else {
-            return;
+            return null;
         }
 
         if ($param) {
             if (isset(self::$locales[$locale])) {
                 return self::$locales[$locale][$param];
             } else {
-                return;
+                return null;
             }
         } else {
             return $data;
@@ -1353,7 +1390,8 @@ class Helper
                     //$value = preg_replace_callback('~(?:(https?)://([^\s<]+)|(www\.[^\s<]+?\.[^\s<]+))(?<![\.,:])~i', function ($match) use ($protocol, &$links, $attr) { 
                     //$value = preg_replace_callback('%(\b(([\w-]+)://?|www[.])[^\s()<>]+(?:\([\w\d]+\)|([^[:punct:]\s]|/)))%s', function ($match) use ($protocol, &$links, $attr) { 
                     // https://github.com/freescout-helpdesk/freescout/issues/3402
-                    $value = preg_replace_callback('%([>\r\n\s:;\( ]|^)((([\w-]+)://?|www[.])[^\s()<>]+(?:\([\w\d]+\)|([^[:punct:]\s]|/)))%s', function ($match) use ($protocol, &$links, $attr) { 
+                    $nbsp = html_entity_decode('&nbsp;');
+                    $value = preg_replace_callback('%([>\r\n\s:;\( '.$nbsp.']|^)((([\w-]+)://?|www[.])[^\s()<>]+(?:\([\w\d]+\)|([^[:punct:]\s]|/)))%s', function ($match) use ($protocol, &$links, $attr) { 
                             if ($match[4]) {
                                 $protocol = $match[4];
                             }
@@ -1412,7 +1450,7 @@ class Helper
         $pids = [];
 
         try {
-            $processes = preg_split("/[\r\n]/", shell_exec("ps aux | grep '".$search."'"));
+            $processes = preg_split("/[\r\n]/", \Helper::shellExec("ps aux | grep '".$search."'"));
             foreach ($processes as $process) {
                 $process = trim($process);
                 preg_match("/^[\S]+\s+([\d]+)\s+/", $process, $m);
@@ -1626,7 +1664,8 @@ class Helper
 
             // 307 - Temporary Redirect.
             if (!preg_match("/(200|301|302|307)/", $headers[0])) {
-                return false;
+                throw new \Exception('HTTP Status Code: '.$headers[0], 1);
+                //return false;
             }
 
             $ch = curl_init();
@@ -1636,14 +1675,19 @@ class Helper
             curl_setopt($ch, CURLOPT_TIMEOUT, 180);
             $contents = curl_exec($ch);
 
-            if (curl_errno($ch)) {
-                throw new \Exception(curl_errno($ch).' '.curl_error($ch), 1);
+            $curl_errno = curl_errno($ch);
+
+            if ($curl_errno) {
+                throw new \Exception('Curl Error Number: '.$curl_errno, 1);
             }
 
-            curl_close($ch);
-
-            if (!$contents) {
-                return false;
+            if ($contents == '') {
+                $https_status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                curl_close($ch);
+                throw new \Exception('Empty Response. Curl Error Number: '.$curl_errno.'. Response Status Code: '.$https_status, 1);
+                //return false;
+            } else {
+                curl_close($ch);
             }
 
             return $contents;
@@ -1697,7 +1741,7 @@ class Helper
         } elseif ($ext == 'pdf') {
             // Rename PDF to avoid running embedded JavaScript.
             if ($uploaded_file && !$contents) {
-                $contents = file_get_contents($uploaded_file->getRealPath());
+                $contents = file_get_contents($uploaded_file->getRealPath() ?: $uploaded_file->getPathname());
             }
             if ($contents && strstr($contents, '/JavaScript')) {
                 $file_name = $file_name.'_';
@@ -1920,7 +1964,7 @@ class Helper
         if (self::isConsole() || !function_exists('shell_exec')) {
             $pcntl_enabled = extension_loaded('pcntl');
         } else {
-            $pcntl_enabled = preg_match("/enable/m", shell_exec("php -i | grep pcntl") ?? '');
+            $pcntl_enabled = preg_match("/enable/m", \Helper::shellExec("php -i | grep pcntl") ?? '');
         }
         $php_extensions['pcntl (console PHP)'] = $pcntl_enabled;
 
@@ -1934,8 +1978,13 @@ class Helper
             'proc_open (PHP)'  => function_exists('proc_open'),
             'fpassthru (PHP)'  => function_exists('fpassthru'),
             'symlink (PHP)'    => function_exists('symlink'),
-            'pcntl_signal (console PHP)'    => function_exists('shell_exec') ? (int)shell_exec('php -r "echo (int)function_exists(\'pcntl_signal\');"') : false,
-            'ps (shell)' => function_exists('shell_exec') ? shell_exec('ps') : false,
+            'iconv (PHP)'      => function_exists('iconv'),
+            // If posix_isatty() function is not enabled on the server the question in the
+            // console command makes it wait infinitely and be aborted.
+            // Commands should avoid using interctive functions or use special flags.
+            //'posix_isatty (PHP)'  => function_exists('posix_isatty'),
+            'pcntl_signal (console PHP)'    => function_exists('shell_exec') ? (int)\Helper::shellExec('php -r "echo (int)function_exists(\'pcntl_signal\');"') : false,
+            'ps (shell)' => function_exists('shell_exec') ? \Helper::shellExec('ps') : false,
         ];
     }
 
@@ -1961,7 +2010,7 @@ class Helper
         if (\Option::get('send_emails_problem')) {
             $flashes[] = [
                 'type'      => 'warning',
-                'text'      =>  __('There is a problem processing outgoing mail queue — an admin should check :%a_begin%System Status:%a_end% and :%a_begin_recommendations%Recommendations:%a_end%', ['%a_begin%' => '<a href="'.route('system').'#cron" target="_blank">', '%a_end%' => '</a>', /*'%a_begin_logs%' => '<a href="'.route('logs', ['name' => 'send_errors']).'#cron" target="_blank">',*/ '%a_begin_recommendations%' => '<a href="https://github.com/freescout-helpdesk/freescout/wiki/Background-Jobs" target="_blank">']),
+                'text'      =>  __('There is a problem processing outgoing mail queue — an admin should check :%a_begin%System Status:%a_end% and :%a_begin_recommendations%Recommendations:%a_end%', ['%a_begin%' => '<a href="'.route('system').'#cron" target="_blank">', '%a_end%' => '</a>', /*'%a_begin_logs%' => '<a href="'.route('logs', ['name' => 'send_errors']).'#cron" target="_blank">',*/ '%a_begin_recommendations%' => '<a href="'.config('app.freescout_repo').'/wiki/Background-Jobs" target="_blank">']),
                 'unescaped' => true,
             ];
         }
@@ -2035,7 +2084,7 @@ class Helper
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, config('app.curl_ssl_verifypeer'));        
     }
 
-    public static function setGuzzleDefaultOptions($params)
+    public static function setGuzzleDefaultOptions($params = [])
     {
         $default_params = [
             'timeout' => config('app.curl_timeout'),
@@ -2066,8 +2115,8 @@ class Helper
         $nonce = \Helper::cspNonce();
 
         return "<meta http-equiv=\"Content-Security-Policy\" content=\"script-src 'self' 'nonce-".$nonce."' "
-            .config('app.csp_script_src').' '.\Eventy::filter('csp.script_src', '')."\">";
-        //<meta property=\"csp-nonce\" id=\"csp-nonce\" content=\"".$nonce."\">";
+            .config('app.csp_script_src').' '.\Eventy::filter('csp.script_src', '').";"
+            .config('app.csp_custom').\Eventy::filter('csp.custom', '')."\">";
     }
 
     public static function cspNonceAttr()
@@ -2096,5 +2145,40 @@ class Helper
         } else {
             \Session::forget('chat_mode');
         }
+    }
+
+    public static function detectCloudFlare()
+    {
+        if (!empty($_SERVER['HTTP_CF_IPCOUNTRY'])
+            || !empty($_SERVER['HTTP_CF_CONNECTING_IP'])
+            || !empty($_SERVER['HTTP_CF_VISITOR'])
+            || !empty($_SERVER['HTTP_CF_RAY'])
+            || ($_SERVER['HTTP_CDN_LOOP'] ?? '') == 'cloudflare'
+        ) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    // Correct format: 2023-12-14 19:21
+    // Datepicker with enableTime option enabled
+    // may return value in different format on iOS Safari: 2023-12-14T11:25
+    public static function sanitizeDatepickerDatetime($datetime)
+    {
+        return str_replace('T', ' ', $datetime);
+    }
+
+    // To catch possible exception:
+    // shell_exec(): Unable to execute
+    public static function shellExec($command)
+    {
+        try {
+            return shell_exec($command);
+        } catch (\Exception $e) {
+            self::logException($e, '\Helper::shellExec() - ');
+        }
+
+        return '';
     }
 }

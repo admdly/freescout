@@ -53,7 +53,7 @@ class SystemController extends Controller
         // Check if cache files are writable.
         $non_writable_cache_file = '';
         if (function_exists('shell_exec')) {
-            $non_writable_cache_file = shell_exec('find '.base_path('storage/framework/cache/data/').' -type f | xargs -I {} sh -c \'[ ! -w "{}" ] && echo {}\' 2>&1 | head -n 1');
+            $non_writable_cache_file = \Helper::shellExec('find '.base_path('storage/framework/cache/data/').' -type f | xargs -I {} sh -c \'[ ! -w "{}" ] && echo {}\' 2>&1 | head -n 1');
             $non_writable_cache_file = trim($non_writable_cache_file ?? '');
             // Leave only one line (in case head -n 1 does not work)
             $non_writable_cache_file = preg_replace("#[\r\n].+#m", '', $non_writable_cache_file);
@@ -80,8 +80,8 @@ class SystemController extends Controller
         $env_is_writable = is_writable(base_path('.env'));
 
         // Jobs
-        $queued_jobs = \App\Job::orderBy('created_at', 'desc')->get();
-        $failed_jobs = \App\FailedJob::orderBy('failed_at', 'desc')->get();
+        $queued_jobs = \App\Job::orderBy('created_at', 'desc')->limit(100)->get();
+        $failed_jobs = \App\FailedJob::orderBy('failed_at', 'desc')->limit(100)->get();
         $failed_queues = $failed_jobs->pluck('queue')->unique();
 
         // Commands
@@ -97,7 +97,7 @@ class SystemController extends Controller
                 $running_commands = 0;
 
                 try {
-                    $processes = preg_split("/[\r\n]/", shell_exec("ps aux | grep '{$command_identifier}'"));
+                    $processes = preg_split("/[\r\n]/", \Helper::shellExec("ps auxww | grep '{$command_identifier}'"));
                     $pids = [];
                     foreach ($processes as $process) {
                         $process = trim($process);
@@ -290,6 +290,7 @@ class SystemController extends Controller
                 $params = [];
                 $params['--days'] = (int)$request->days;
                 $params['--unseen'] = (int)$request->unseen;
+                $params['--debug'] = (int)$request->debug;
                 \Artisan::call('freescout:fetch-emails', $params, $outputLog);
                 break;
 

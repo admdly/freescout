@@ -44,16 +44,29 @@
             </tr>
             <tr>
                 <th>{{ __('Date & Time') }}</th>
-                <td class="table-main-col">{{ App\User::dateFormat(new Illuminate\Support\Carbon()) }}</td>
+                <td class="table-main-col">{{ App\User::dateFormat(new Illuminate\Support\Carbon(), 'M j, Y H:i', null, true, false) }}</td>
             </tr>
             <tr>
-                <th>{{ __('Timezone') }}</th>
+                <th>{{ __('Timezone') }} (.env)</th>
                 <td class="table-main-col">{{ \Config::get('app.timezone') }} (GMT{{ date('O') }})</td>
             </tr>
             <tr>
                 <th>{{ __('Protocol') }}</th>
                 <td class="table-main-col" id="system-app-protocol"></td>
             </tr>
+            @if (\Helper::detectCloudFlare())
+                @php
+                    $cloudflare_is_used = config('app.cloudflare_is_used');
+                @endphp
+                <tr>
+                    <th>Proxy</th>
+                    <td class="table-main-col">
+                        <div @if (!$cloudflare_is_used) class="alert alert-warning alert-narrow margin-bottom-0" @endif>
+                            @if (!$cloudflare_is_used)<i class="glyphicon glyphicon-exclamation-sign"></i> @endif{{ 'CloudFlare' }} (<a href="{{ config('app.freescout_repo') }}/wiki/Installation-Guide#103-cloudflare" target="_blank">{{ __('read more') }}</a>)
+                        </div>
+                    </td>
+                </tr>
+            @endif
             {{--<tr>
                 <th>{{ __('.env file') }}</th>
                 <td class="table-main-col">
@@ -130,7 +143,7 @@
     </table>
 
     <h3 id="permissions">{{ __('Permissions') }}</h3>
-    {!! __('These folders must be writable by web server user (:user).', ['user' => '<strong>'.get_current_user().'</strong>']) !!} {{ __('Recommended permissions') }}: <strong>775</strong>
+    {!! __('These folders must be writable by web server user (:user).', ['user' => '<strong>'.(function_exists('get_current_user') ? get_current_user() : '').'</strong>']) !!} {{ __('Recommended permissions') }}: <strong>775</strong>
     <table class="table table-dark-header table-bordered table-responsive table-narrow">
         <tbody>
             @foreach ($permissions as $perm_path => $perm)
@@ -143,7 +156,7 @@
                                 <br/>
                                 <span class="text-danger">{{ $non_writable_cache_file }}</span>
                                 <br/><br/>
-                                {{ __('Run the following command') }} (<a href="https://github.com/freescout-helpdesk/freescout/wiki/Installation-Guide#6-configuring-web-server" target="_blank">{{ __('read more') }}</a>):<br/>
+                                {{ __('Run the following command') }} (<a href="{{ config('app.freescout_repo') }}/wiki/Installation-Guide#6-configuring-web-server" target="_blank">{{ __('read more') }}</a>):<br/>
                                 <code>sudo chown -R www-data:www-data {{ base_path() }}</code>
                             @elseif (!$perm['status'])
                                 <strong class="text-danger">{{ __('Not writable') }} @if ($perm['value'])({{ $perm['value'] }})@endif</strong>
@@ -157,7 +170,7 @@
                                 <strong class="text-danger">{{ __('Not writable') }} @if ($perm['value'])({{ $perm['value'] }})@endif</strong>
 
                                 <br/><br/>
-                                {{ __('Run the following command') }} (<a href="https://github.com/freescout-helpdesk/freescout/wiki/Installation-Guide#6-configuring-web-server" target="_blank">{{ __('read more') }}</a>):<br/>
+                                {{ __('Run the following command') }} (<a href="{{ config('app.freescout_repo') }}/wiki/Installation-Guide#6-configuring-web-server" target="_blank">{{ __('read more') }}</a>):<br/>
                                 <code>sudo chown -R www-data:www-data {{ base_path() }}</code>
                             @endif
                         @endif

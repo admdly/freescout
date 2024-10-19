@@ -502,6 +502,14 @@ class Customer extends Model
     }
 
     /**
+     * Check if the customer has an email address among his emails.
+     */
+    public function hasEmail($email_address)
+    {
+        return $this->emails_cached()->where('email', Email::sanitizeEmail($email_address))->exists();
+    }
+
+    /**
      * Get customer full name.
      *
      * @return string
@@ -1013,6 +1021,14 @@ class Customer extends Model
             $result = true;
         } else {
             // Update empty fields.
+            
+            // Do not set last name if first name is already set (and vise versa).
+            if (!empty($this->first_name) && !empty($data['last_name'])) {
+                unset($data['last_name']);
+            }
+            if (!empty($this->last_name) && !empty($data['first_name'])) {
+                unset($data['first_name']);
+            }
             foreach ($data as $key => $value) {
                 if (in_array($key, $this->fillable) && empty($this->$key)) {
                     $this->$key = $value;
@@ -1528,6 +1544,18 @@ class Customer extends Model
         } else {
             return $customers;
         }
+    }
+
+    /**
+     * Get dummy customer.
+     */
+    public static function getDummyCustomer()
+    {
+        $customer = new self();
+        $customer->first_name = __('Customer');
+        $customer->last_name = '';
+
+        return $customer;
     }
 }
 

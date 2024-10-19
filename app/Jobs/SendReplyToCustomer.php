@@ -3,6 +3,7 @@
 namespace App\Jobs;
 
 use App\Mail\ReplyToCustomer;
+use App\Customer;
 use App\SendLog;
 use App\Thread;
 use App\Misc\SwiftGetSmtpQueueId;
@@ -116,6 +117,17 @@ class SendReplyToCustomer implements ShouldQueue
             return;
         }
 
+        // After sending an email we are saving it into "IMAP Folder To Save Outgoing Replies".
+        // This process may stuck or make SendReplyToCustomer job die with
+        // "Allowed memory size of NNN bytes exhausted" error.
+        // https://github.com/freescout-helpdesk/freescout/issues/3632
+        if ($this->attempts() >= 1 && 
+            ($this->last_thread->send_status == SendLog::STATUS_ACCEPTED
+                || $this->last_thread->isSendStatusSuccess())
+        ) {
+            return;
+        }
+
         if (count($this->threads) == 1) {
             $new = true;
         }
@@ -219,6 +231,12 @@ class SendReplyToCustomer implements ShouldQueue
             }
         }
 
+        // Try to get customer by email
+        if (!$this->customer) {
+            $this->customer = Customer::getByEmail($this->customer_email);
+            return;
+        }
+
         $to_array = $mailbox->removeMailboxEmailsFromList($this->last_thread->getToArray());
         $cc_array = $mailbox->removeMailboxEmailsFromList($this->last_thread->getCcArray());
         $bcc_array = $mailbox->removeMailboxEmailsFromList($this->last_thread->getBccArray());
@@ -266,11 +284,16 @@ class SendReplyToCustomer implements ShouldQueue
 
         $reply_mail = new ReplyToCustomer($this->conversation, $this->threads, $headers, $mailbox, $subject, $threads_count);
 
+        $smtp_queue_id = null;
+        
         try {
             Mail::to($to)
                 ->cc($cc_array)
                 ->bcc($bcc_array)
                 ->send($reply_mail);
+
+            $this->last_thread->send_status = SendLog::STATUS_ACCEPTED;
+            $this->last_thread->save();
 
             $smtp_queue_id = SwiftGetSmtpQueueId::$last_smtp_queue_id;
         } catch (\Exception $e) {
@@ -351,8 +374,18 @@ class SendReplyToCustomer implements ShouldQueue
                 
                 $client->connect();
 
-                $envelope['from'] = $mailbox->getMailFrom(null, $this->conversation)['address'];
-                $envelope['to'] = $this->customer_email;
+                $mail_from = $mailbox->getMailFrom($this->last_thread->created_by_user ?? null, $this->conversation);
+
+                if (!empty($mail_from['name'])) {
+                    $envelope['from'] = '"'.$mail_from['name'].'" <'.$mail_from['address'].'>';
+                } else {
+                    $envelope['from'] = $mail_from['address'];
+                }
+                if (is_array($to) && !empty($to[0]) && !empty($to[0]['name']) && !empty($to[0]['email'])) {
+                    $envelope['to'] = '"'.$to[0]['name'].'" <'.$to[0]['email'].'>';
+                } else {
+                    $envelope['to'] = $this->customer_email;
+                }
                 $envelope['subject'] = $subject;
                 $envelope['date'] = now()->toRfc2822String();
                 $envelope['message_id'] = $this->message_id;
@@ -380,7 +413,9 @@ class SendReplyToCustomer implements ShouldQueue
                 if ($this->last_thread->has_attachments) {
                     $multipart = [];
                     $multipart["type"] = TYPEMULTIPART;
-                    $multipart["subtype"] = "alternative";
+                    $multipart["subtype"] = "mixed";
+                    // https://github.com/freescout-helpdesk/freescout/issues/3934
+                    //$multipart["subtype"] = "alternative";
                     $parts[] = $multipart;
                 }
 
